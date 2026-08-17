@@ -40,30 +40,34 @@ def convert(source_path, output_path):
     output = {}
     with safe_open(source_path, framework="pt", device="cpu") as source:
         keys = set(source.keys())
+        source_namespace = "diffusion_model." if all(key.startswith("diffusion_model.") for key in keys) else ""
+        curve_compatible = not any(".adaln_proj.linear." in key for key in keys)
         for index in range(50):
-            source_prefix = f"blocks.{index}"
+            source_prefix = f"{source_namespace}blocks.{index}"
             target_prefix = f"transformer_blocks.{index}"
             _convert_block(source, output, source_prefix, target_prefix)
-            lora_a, lora_b = _pair(source, f"{source_prefix}.adaln_proj.linear")
-            _store_pair(output, f"{target_prefix}.adaln_proj.linear", lora_a, lora_b)
+            if not curve_compatible:
+                lora_a, lora_b = _pair(source, f"{source_prefix}.adaln_proj.linear")
+                _store_pair(output, f"{target_prefix}.adaln_proj.linear", lora_a, lora_b)
 
         for index in range(2):
             _convert_block(
                 source,
                 output,
-                f"token_refiner.blocks.{index}",
+                f"{source_namespace}token_refiner.blocks.{index}",
                 f"token_refiner.refiner_blocks.{index}",
             )
 
-        lora_a, lora_b = _pair(source, "final_layer.adaln_proj.linear")
-        _store_pair(output, "norm_out.linear", lora_a, lora_b)
+        if not curve_compatible:
+            lora_a, lora_b = _pair(source, f"{source_namespace}final_layer.adaln_proj.linear")
+            _store_pair(output, "norm_out.linear", lora_a, lora_b)
 
         for key in output:
             # Converted keys cannot be used to reconstruct fused QKV source
             # names, so verify the source contract independently below.
             if key.endswith(".alpha"):
                 raise AssertionError("Turbo v4 conversion must not synthesize alpha tensors")
-        expected_pairs = 50 * 5 + 2 * 4 + 1
+        expected_pairs = 50 * (4 if curve_compatible else 5) + 2 * 4 + (0 if curve_compatible else 1)
         source_pairs = len(keys) // 2
         if source_pairs != expected_pairs or any(key.endswith(".alpha") for key in keys):
             raise ValueError(
@@ -78,6 +82,8 @@ def convert(source_path, output_path):
             "source": os.path.basename(source_path),
             "scale": "1.0 (source has no alpha tensors)",
             "qkv": "split q/k/v with shared lora_A",
+            "curve_compatible": str(curve_compatible).lower(),
+            "source_namespace": source_namespace or "none",
         },
     )
     print(f"converted {len(output)} tensors -> {output_path}")
