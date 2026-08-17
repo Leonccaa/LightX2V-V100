@@ -6,16 +6,17 @@
   "fps": 24,
   "target_fps": 24,
   "enable_cfg": false,
-  "cpu_offload": false,
+  "cpu_offload": true,
   "offload_granularity": "model",
-  "text_encoder_cpu_offload": false,
+  "text_encoder_cpu_offload": true,
   "text_encoder_tensor_parallel": true,
   "vae_cpu_offload": true,
   "lazy_load": false,
   "unload_modules": false,
-  "attn_type": "sage_attn2",
+  "attn_type": "torch_sdpa",
   "rms_type": "sgl-kernel",
-  "rope_type": "torch_real_rope",
+  "tp_mm_type": "IntelTensorParallel",
+  "rope_type": "minimax_h3_triton_rope",
   "feature_caching": "NoCaching",
   "use_compile": false,
   "video_flow_shift": 12.0,
@@ -26,8 +27,9 @@
   "audio_channels": 2,
   "keep_latents_dtype_in_scheduler": true,
   "parallel": {
-    "tensor_p_size": 2,
-    "seq_p_size": 4,
-    "seq_p_attn_type": "ulysses"
+    "seq_p_size": 2,
+    "seq_p_attn_type": "ulysses",
+    "seq_p_a2a_backend": "torch",
+    "tensor_p_size": 4
   }
 }

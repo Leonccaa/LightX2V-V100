@@ -1,4 +1,5 @@
 import glob
+import math
 import os
 import time
 
@@ -18,6 +19,7 @@ from lightx2v.models.networks.minimax_h3.weights import (
     MiniMaxH3PreWeights,
     MiniMaxH3TransformerWeights,
 )
+from lightx2v.models.networks.minimax_h3.weights.tensor_parallel import unwrap_tp_linear
 from lightx2v.utils.envs import GET_DTYPE
 
 H3_CHANNEL_QUANT_SCHEMES = {
@@ -41,7 +43,8 @@ class MiniMaxH3Model(BaseTransformerModel):
     transformer_weight_class = MiniMaxH3TransformerWeights
     post_weight_class = MiniMaxH3PostWeights
 
-    def __init__(self, model_path, config, device):
+    def __init__(self, model_path, config, device, lora_path=None, lora_strength=1.0, lora_alpha=None):
+        self.lora_alpha = lora_alpha
         self.h3_checkpoint_file_stats = []
         self.h3_v100_fp16 = bool(config.get("h3_v100_fp16", False))
         self.h3_adaln_curve = bool(config.get("h3_adaln_curve", False))
@@ -61,8 +64,6 @@ class MiniMaxH3Model(BaseTransformerModel):
                 raise ValueError("MiniMax-H3 quantized inference requires dit_quantized_ckpt")
         elif config.get("dit_quant_scheme", "Default") != "Default":
             raise ValueError("MiniMax-H3 dit_quant_scheme requires a dit_quantized_ckpt")
-        if config.get("lora_dynamic_apply", False):
-            raise NotImplementedError("MiniMax-H3 currently supports load-time LoRA merging; set lora_dynamic_apply=false")
         if config.get("cpu_offload", False) and config.get("offload_granularity", "model") not in {"model", "block"}:
             raise NotImplementedError("MiniMax-H3 supports model and block CPU offload")
         if self.h3_adaln_curve:
@@ -73,9 +74,13 @@ class MiniMaxH3Model(BaseTransformerModel):
                     "MiniMax-H3 curve checkpoints require adaln_curve_grid>=2 and time_embed_dim>=1; "
                     f"got grid={curve_grid}, basis={curve_basis}"
                 )
+        if config.get("attn_type") == "sol_attn":
+            reorder = str(config.get("sol_attn_setting", {}).get("reorder", "none")).lower()
+            if reorder != "none":
+                raise ValueError("MiniMax-H3 Sol-Attn requires sol_attn_setting.reorder='none': H3 packs text, audio, and video into one sequence, so Wan's pure-video Morton3D reorder is not valid.")
 
         transformer_path = config.get("dit_original_ckpt") or os.path.join(model_path, "transformer")
-        super().__init__(transformer_path, config, device)
+        super().__init__(transformer_path, config, device, lora_path=lora_path, lora_strength=lora_strength)
         self._validate_tensor_parallel_config()
         if config.get("seq_parallel", False):
             parallel_type = config.get("parallel", {}).get("seq_p_attn_type", "ulysses")
@@ -101,6 +106,192 @@ class MiniMaxH3Model(BaseTransformerModel):
         self._init_infer_class()
         self._init_weights()
         self._init_infer()
+
+    def _apply_weights(self, weight_dict=None):
+        if self.config.get("lora_dynamic_apply", False):
+            source = weight_dict if weight_dict is not None else self.original_weight_dict
+            self._h3_weight_shapes = {key: tuple(tensor.shape) for key, tensor in source.items() if isinstance(tensor, torch.Tensor) and tensor.ndim == 2}
+        return super()._apply_weights(weight_dict)
+
+    @staticmethod
+    def _normalize_dynamic_lora_key(key):
+        for prefix in ("base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer.", "model."):
+            if key.startswith(prefix):
+                key = key[len(prefix) :]
+                break
+
+        suffixes = {
+            ".lora_A.default.weight": ".lora_down.weight",
+            ".lora_B.default.weight": ".lora_up.weight",
+            ".lora_A.weight": ".lora_down.weight",
+            ".lora_B.weight": ".lora_up.weight",
+            ".lora.down.weight": ".lora_down.weight",
+            ".lora.up.weight": ".lora_up.weight",
+            ".lora_down.weight": ".lora_down.weight",
+            ".lora_up.weight": ".lora_up.weight",
+        }
+        for suffix, replacement in suffixes.items():
+            if key.endswith(suffix):
+                return key[: -len(suffix)] + replacement
+        if key.endswith(".alpha"):
+            return key
+        return None
+
+    def _validate_dynamic_lora_shapes(self, source, normalized_sources, down_names):
+        model_keys = set()
+        ranks = set()
+        for down_name in sorted(down_names):
+            base_name = down_name[: -len(".lora_down.weight")]
+            up_name = base_name + ".lora_up.weight"
+            model_key = base_name + ".weight"
+            down_shape = tuple(source.get_slice(normalized_sources[down_name]).get_shape())
+            up_shape = tuple(source.get_slice(normalized_sources[up_name]).get_shape())
+            if len(down_shape) != 2 or len(up_shape) != 2 or down_shape[0] != up_shape[1]:
+                raise ValueError(f"Invalid MiniMax-H3 LoRA pair for {model_key}: down={down_shape}, up={up_shape}")
+
+            expected_shape = [up_shape[0], down_shape[1]]
+            if self.use_tp:
+                split_type = self._tp_split_type(model_key)
+                if split_type == "row":
+                    if expected_shape[1] % self.tp_size:
+                        raise ValueError(f"Cannot row-shard MiniMax-H3 LoRA {model_key} shape {tuple(expected_shape)} across TP size {self.tp_size}")
+                    expected_shape[1] //= self.tp_size
+                elif split_type is not None:
+                    if expected_shape[0] % self.tp_size:
+                        raise ValueError(f"Cannot column-shard MiniMax-H3 LoRA {model_key} shape {tuple(expected_shape)} across TP size {self.tp_size}")
+                    expected_shape[0] //= self.tp_size
+
+            base_shape = self._h3_weight_shapes.get(model_key)
+            if base_shape is None:
+                raise KeyError(f"MiniMax-H3 LoRA target does not exist in the loaded model: {model_key}")
+            if tuple(expected_shape) != base_shape:
+                raise ValueError(f"MiniMax-H3 LoRA shape mismatch for {model_key}: LoRA={tuple(expected_shape)}, base={base_shape}")
+            model_keys.add(model_key)
+            ranks.add(down_shape[0])
+        return model_keys, ranks
+
+    def _load_lora_file(self, file_path, alpha=None):
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"MiniMax-H3 LoRA file not found: {file_path}")
+
+        effective_alpha = self.lora_alpha if alpha is None else alpha
+        if effective_alpha is not None:
+            effective_alpha = float(effective_alpha)
+            if not math.isfinite(effective_alpha) or effective_alpha <= 0:
+                raise ValueError(f"MiniMax-H3 LoRA alpha must be finite and positive, got {effective_alpha}")
+
+        load_device = self._checkpoint_load_device()
+        with safe_open(file_path, framework="pt", device=load_device) as source:
+            normalized_sources = {}
+            unsupported = []
+            for source_key in source.keys():
+                normalized_key = self._normalize_dynamic_lora_key(source_key)
+                if normalized_key is None:
+                    unsupported.append(source_key)
+                    continue
+                if normalized_key in normalized_sources:
+                    raise ValueError(f"MiniMax-H3 LoRA keys collide after normalization: {source_key} and {normalized_sources[normalized_key]}")
+                normalized_sources[normalized_key] = source_key
+            if unsupported:
+                raise ValueError(f"MiniMax-H3 dynamic LoRA contains {len(unsupported)} unsupported tensors: {unsupported[:4]}")
+
+            down_names = {key for key in normalized_sources if key.endswith(".lora_down.weight")}
+            up_names = {key for key in normalized_sources if key.endswith(".lora_up.weight")}
+            expected_up_names = {key[: -len(".lora_down.weight")] + ".lora_up.weight" for key in down_names}
+            if not down_names or up_names != expected_up_names:
+                missing_up = sorted(expected_up_names - up_names)
+                orphan_up = sorted(up_names - expected_up_names)
+                raise ValueError(f"MiniMax-H3 dynamic LoRA has incomplete pairs: missing_up={missing_up[:3]}, orphan_up={orphan_up[:3]}")
+
+            model_keys, ranks = self._validate_dynamic_lora_shapes(source, normalized_sources, down_names)
+            expected_alpha_names = {key[: -len(".lora_down.weight")] + ".alpha" for key in down_names}
+            alpha_names = {key for key in normalized_sources if key.endswith(".alpha")}
+            orphan_alpha = sorted(alpha_names - expected_alpha_names)
+            if orphan_alpha:
+                raise ValueError(f"MiniMax-H3 dynamic LoRA contains alpha tensors without matching pairs: {orphan_alpha[:3]}")
+            missing_alpha = expected_alpha_names - alpha_names
+            if missing_alpha and effective_alpha is None:
+                raise ValueError("MiniMax-H3 dynamic LoRA requires an alpha in lora_configs because the checkpoint has no per-layer alpha tensors")
+
+            lora_weights = {}
+            for normalized_key, source_key in normalized_sources.items():
+                tensor = source.get_tensor(source_key).to(GET_DTYPE())
+                lora_weights[normalized_key] = tensor.pin_memory() if torch.device(load_device).type == "cpu" else tensor
+            for alpha_name in missing_alpha:
+                alpha_tensor = torch.tensor(effective_alpha, dtype=GET_DTYPE(), device=load_device)
+                lora_weights[alpha_name] = alpha_tensor.pin_memory() if alpha_tensor.device.type == "cpu" else alpha_tensor
+
+        self._pending_dynamic_lora_model_keys = model_keys
+        if effective_alpha is not None:
+            self.lora_alpha = effective_alpha
+        logger.info(
+            "Loaded MiniMax-H3 dynamic LoRA {} (pairs={}, ranks={}, alpha={}, device={})",
+            file_path,
+            len(model_keys),
+            sorted(ranks),
+            effective_alpha,
+            load_device,
+        )
+        return lora_weights
+
+    @staticmethod
+    def _iter_weight_objects(*roots):
+        stack = list(roots)
+        visited = set()
+        while stack:
+            obj = stack.pop()
+            if obj is None or id(obj) in visited:
+                continue
+            visited.add(id(obj))
+            yield unwrap_tp_linear(obj)
+            stack.extend(getattr(obj, "_modules", {}).values())
+            stack.extend(getattr(obj, "_parameters", {}).values())
+
+    def _register_dynamic_lora_weights(self, lora_weights, strength):
+        strength = float(strength)
+        if not math.isfinite(strength):
+            raise ValueError(f"MiniMax-H3 LoRA strength must be finite, got {strength}")
+        self.pre_weight.register_lora(lora_weights, strength)
+        self.transformer_weights.register_lora(lora_weights, strength)
+        self.post_weight.register_lora(lora_weights, strength)
+
+        weights = list(self._iter_weight_objects(self.pre_weight, self.transformer_weights, self.post_weight))
+        for weight in weights:
+            if getattr(weight, "pin_weight", None) is None or getattr(weight, "weight", None) is not None:
+                continue
+            for attr_name in ("lora_down", "lora_up", "lora_alpha", "lora_scale"):
+                tensor = getattr(weight, attr_name, None)
+                if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
+                    tensor = tensor.to("cpu")
+                    setattr(weight, attr_name, tensor.pin_memory())
+
+        registered = {weight.weight_name for weight in weights if getattr(weight, "has_lora_branch", False)}
+        missing = sorted(self._pending_dynamic_lora_model_keys - registered)
+        if missing:
+            self._remove_lora()
+            raise RuntimeError(f"MiniMax-H3 failed to register {len(missing)} dynamic LoRA branches: {missing[:4]}")
+        logger.info("Registered {} MiniMax-H3 dynamic LoRA branches with strength={}", len(self._pending_dynamic_lora_model_keys), strength)
+
+    def _register_lora(self, lora_path, strength):
+        lora_weights = self._load_lora_file(lora_path)
+        self._register_dynamic_lora_weights(lora_weights, strength)
+        self.lora_path = lora_path
+        self.lora_strength = float(strength)
+        offload_manager = getattr(getattr(self, "transformer_infer", None), "offload_manager", None)
+        if offload_manager is not None:
+            offload_manager.need_init_first_buffer = True
+
+    def _update_lora(self, lora_path, strength, alpha=None):
+        if isinstance(lora_path, dict):
+            raise NotImplementedError("MiniMax-H3 dynamic LoRA switching expects one checkpoint path, not a merged tensor dictionary")
+        lora_weights = self._load_lora_file(lora_path, alpha=alpha)
+        self._remove_lora()
+        self._register_dynamic_lora_weights(lora_weights, strength)
+        self.lora_path = lora_path
+        self.lora_strength = float(strength)
+        offload_manager = getattr(getattr(self, "transformer_infer", None), "offload_manager", None)
+        if offload_manager is not None:
+            offload_manager.need_init_first_buffer = True
 
     def _validate_tensor_parallel_config(self):
         if not self.use_tp:
@@ -225,12 +416,11 @@ class MiniMaxH3Model(BaseTransformerModel):
         load_device = self._checkpoint_load_device()
         logger.info(f"MiniMax-H3 rank {dist.get_rank() if dist.is_initialized() else 0} loading TP checkpoint shards on {load_device}")
         for file_path in files:
-            with safe_open(file_path, framework="pt", device=load_device) as source:
+            with safe_open(file_path, framework="pt", device="cpu") as source:
                 for key in source.keys():
                     if any(remove_key in key for remove_key in remove_keys):
                         continue
-                    tensor = self._coerce_checkpoint_tensor(key, source.get_tensor(key))
-                    weight_dict[key] = self._select_tensor_parallel_shard(key, tensor)
+                    weight_dict[key] = self._load_local_tensor(source, key, load_device)
         self._validate_checkpoint_devices(weight_dict, load_device)
         return weight_dict
 
@@ -256,6 +446,18 @@ class MiniMaxH3Model(BaseTransformerModel):
             preview = ", ".join(misplaced[:4])
             raise RuntimeError(f"MiniMax-H3 checkpoint tensors were not loaded on {expected}: {preview}")
 
+    def _prepare_local_tensor(self, key, tensor, load_device):
+        """Apply route dtype policy, shard on CPU, then copy only this rank."""
+        tensor = self._coerce_checkpoint_tensor(key, tensor)
+        tensor = self._select_tensor_parallel_shard(key, tensor)
+        if torch.device(load_device).type != "cpu":
+            tensor = tensor.to(load_device)
+        return tensor
+
+    def _load_local_tensor(self, source, key, load_device):
+        """Load and prepare one tensor from a CPU-backed checkpoint source."""
+        return self._prepare_local_tensor(key, source.get_tensor(key), load_device)
+
     def _load_safetensor_to_dict(self, file_path, unified_dtype, sensitive_layer):
         """Load released tensors, with opt-in Volta FP16 coercion before TP sharding."""
         del unified_dtype, sensitive_layer
@@ -264,52 +466,45 @@ class MiniMaxH3Model(BaseTransformerModel):
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
         preserve_keys = self.preserved_keys if hasattr(self, "preserved_keys") else None
         load_device = self._checkpoint_load_device()
-        if not self.config.get("h3_benchmark_load_telemetry", False):
-            with safe_open(file_path, framework="pt", device=load_device) as source:
-                weight_dict = {
-                    key: self._select_tensor_parallel_shard(key, self._coerce_checkpoint_tensor(key, source.get_tensor(key)))
-                    for key in source.keys()
-                    if not any(remove_key in key for remove_key in remove_keys) and (preserve_keys is None or any(preserve_key in key for preserve_key in preserve_keys))
-                }
-            self._validate_checkpoint_devices(weight_dict, load_device)
-            return weight_dict
-
-        started_epoch = time.time()
-        started = time.perf_counter()
+        telemetry = bool(self.config.get("h3_benchmark_load_telemetry", False))
+        started_epoch = time.time() if telemetry else None
+        started = time.perf_counter() if telemetry else None
         source_tensor_bytes = 0
         retained_tensor_bytes = 0
         tensor_count = 0
         weight_dict = {}
-        with safe_open(file_path, framework="pt", device=load_device) as source:
+        # Reading a full tensor directly on the accelerator and then slicing it
+        # can retain the full safetensors storage behind a small TP view. Shard
+        # on CPU first so accelerator memory contains only this rank's weights.
+        with safe_open(file_path, framework="pt", device="cpu") as source:
             for key in source.keys():
                 if any(remove_key in key for remove_key in remove_keys):
                     continue
                 if preserve_keys is not None and not any(preserve_key in key for preserve_key in preserve_keys):
                     continue
                 source_tensor = source.get_tensor(key)
-                source_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
-                retained_tensor = self._select_tensor_parallel_shard(
-                    key,
-                    self._coerce_checkpoint_tensor(key, source_tensor),
-                )
-                retained_tensor_bytes += retained_tensor.numel() * retained_tensor.element_size()
-                tensor_count += 1
+                retained_tensor = self._prepare_local_tensor(key, source_tensor, load_device)
+                if telemetry:
+                    source_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
+                    retained_tensor_bytes += retained_tensor.numel() * retained_tensor.element_size()
+                    tensor_count += 1
                 weight_dict[key] = retained_tensor
-        if torch.device(load_device).type == "cuda":
+        if telemetry and torch.device(load_device).type == "cuda":
             torch.cuda.synchronize(torch.device(load_device))
         self._validate_checkpoint_devices(weight_dict, load_device)
-        self.h3_checkpoint_file_stats.append(
-            {
-                "file": os.path.basename(file_path),
-                "file_size_bytes": os.path.getsize(file_path),
-                "tensor_count": tensor_count,
-                "source_tensor_bytes": source_tensor_bytes,
-                "retained_tensor_bytes": retained_tensor_bytes,
-                "started_epoch": started_epoch,
-                "finished_epoch": time.time(),
-                "elapsed_seconds": time.perf_counter() - started,
-            }
-        )
+        if telemetry:
+            self.h3_checkpoint_file_stats.append(
+                {
+                    "file": os.path.basename(file_path),
+                    "file_size_bytes": os.path.getsize(file_path),
+                    "tensor_count": tensor_count,
+                    "source_tensor_bytes": source_tensor_bytes,
+                    "retained_tensor_bytes": retained_tensor_bytes,
+                    "started_epoch": started_epoch,
+                    "finished_epoch": time.time(),
+                    "elapsed_seconds": time.perf_counter() - started,
+                }
+            )
         return weight_dict
 
     def _init_infer_class(self):
