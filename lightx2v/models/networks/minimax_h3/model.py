@@ -1,5 +1,6 @@
 import glob
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -41,9 +42,13 @@ class MiniMaxH3Model(BaseTransformerModel):
     post_weight_class = MiniMaxH3PostWeights
 
     def __init__(self, model_path, config, device):
-        if GET_DTYPE() != torch.bfloat16:
+        self.h3_checkpoint_file_stats = []
+        self.h3_v100_fp16 = bool(config.get("h3_v100_fp16", False))
+        dtype = GET_DTYPE()
+        if dtype != torch.bfloat16 and not (self.h3_v100_fp16 and dtype == torch.float16):
             raise ValueError(
-                "MiniMax-H3 requires DTYPE=BF16. The native loader preserves the released checkpoint's 626 BF16 tensors and 12 FP32 projection/time/head tensors without dtype conversion."
+                "MiniMax-H3 requires DTYPE=BF16 unless the isolated h3_v100_fp16 route is enabled with DTYPE=FP16. "
+                "The default native loader preserves the released checkpoint's mixed precision without conversion."
             )
         if config.get("cfg_parallel", False) or config.get("enable_cfg", False):
             raise ValueError("MiniMax-H3 is guidance-distilled and does not have a CFG/unconditional branch")
@@ -144,7 +149,20 @@ class MiniMaxH3Model(BaseTransformerModel):
 
         if tensor.shape[0] % self.tp_size:
             raise ValueError(f"Cannot column-shard {key} shape {tuple(tensor.shape)} across TP size {self.tp_size}")
-        return torch.chunk(tensor, self.tp_size, dim=0)[self.tp_rank].contiguous()
+        # A dim-0 chunk is already contiguous, so ``.contiguous()`` alone
+        # returns a view that retains the full unsharded storage. Clone it to
+        # make the TP shard own only its quarter of the checkpoint tensor.
+        return torch.chunk(tensor, self.tp_size, dim=0)[self.tp_rank].clone(memory_format=torch.contiguous_format)
+
+    def _coerce_checkpoint_tensor(self, key, tensor):
+        """Apply the isolated Volta-safe storage policy before TP sharding."""
+        if not self.h3_v100_fp16:
+            return tensor
+        if key.startswith(("context_embedder.", "token_refiner.")):
+            return tensor.to(torch.float32)
+        if tensor.dtype == torch.bfloat16:
+            return tensor.to(torch.float16)
+        return tensor
 
     def _should_load_weights(self):
         # Each TP rank reads its own slices.  This is also correct for TP+SP,
@@ -162,9 +180,10 @@ class MiniMaxH3Model(BaseTransformerModel):
 
     def _load_dummy_ckpt(self, unified_dtype, sensitive_layer):
         weight_dict = super()._load_dummy_ckpt(unified_dtype, sensitive_layer)
-        if not self.use_tp:
-            return weight_dict
-        return {key: self._select_tensor_parallel_shard(key, tensor) for key, tensor in weight_dict.items()}
+        return {
+            key: self._select_tensor_parallel_shard(key, self._coerce_checkpoint_tensor(key, tensor))
+            for key, tensor in weight_dict.items()
+        }
 
     def _load_ckpt(self, unified_dtype, sensitive_layer):
         # BaseTransformerModel forces rank-0 TP loading through CPU. H3 shards
@@ -199,7 +218,8 @@ class MiniMaxH3Model(BaseTransformerModel):
                 for key in source.keys():
                     if any(remove_key in key for remove_key in remove_keys):
                         continue
-                    weight_dict[key] = self._select_tensor_parallel_shard(key, source.get_tensor(key))
+                    tensor = self._coerce_checkpoint_tensor(key, source.get_tensor(key))
+                    weight_dict[key] = self._select_tensor_parallel_shard(key, tensor)
         self._validate_checkpoint_devices(weight_dict, load_device)
         return weight_dict
 
@@ -226,20 +246,59 @@ class MiniMaxH3Model(BaseTransformerModel):
             raise RuntimeError(f"MiniMax-H3 checkpoint tensors were not loaded on {expected}: {preview}")
 
     def _load_safetensor_to_dict(self, file_path, unified_dtype, sensitive_layer):
-        """Load the released mixed-precision tensors without generic dtype coercion."""
+        """Load released tensors, with opt-in Volta FP16 coercion before TP sharding."""
         del unified_dtype, sensitive_layer
         if os.path.splitext(file_path)[-1] != ".safetensors":
             raise ValueError(f"MiniMax-H3 native loading expects the released safetensors checkpoint; got {file_path}")
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
         preserve_keys = self.preserved_keys if hasattr(self, "preserved_keys") else None
         load_device = self._checkpoint_load_device()
+        if not self.config.get("h3_benchmark_load_telemetry", False):
+            with safe_open(file_path, framework="pt", device=load_device) as source:
+                weight_dict = {
+                    key: self._select_tensor_parallel_shard(key, self._coerce_checkpoint_tensor(key, source.get_tensor(key)))
+                    for key in source.keys()
+                    if not any(remove_key in key for remove_key in remove_keys) and (preserve_keys is None or any(preserve_key in key for preserve_key in preserve_keys))
+                }
+            self._validate_checkpoint_devices(weight_dict, load_device)
+            return weight_dict
+
+        started_epoch = time.time()
+        started = time.perf_counter()
+        source_tensor_bytes = 0
+        retained_tensor_bytes = 0
+        tensor_count = 0
+        weight_dict = {}
         with safe_open(file_path, framework="pt", device=load_device) as source:
-            weight_dict = {
-                key: self._select_tensor_parallel_shard(key, source.get_tensor(key))
-                for key in source.keys()
-                if not any(remove_key in key for remove_key in remove_keys) and (preserve_keys is None or any(preserve_key in key for preserve_key in preserve_keys))
-            }
+            for key in source.keys():
+                if any(remove_key in key for remove_key in remove_keys):
+                    continue
+                if preserve_keys is not None and not any(preserve_key in key for preserve_key in preserve_keys):
+                    continue
+                source_tensor = source.get_tensor(key)
+                source_tensor_bytes += source_tensor.numel() * source_tensor.element_size()
+                retained_tensor = self._select_tensor_parallel_shard(
+                    key,
+                    self._coerce_checkpoint_tensor(key, source_tensor),
+                )
+                retained_tensor_bytes += retained_tensor.numel() * retained_tensor.element_size()
+                tensor_count += 1
+                weight_dict[key] = retained_tensor
+        if torch.device(load_device).type == "cuda":
+            torch.cuda.synchronize(torch.device(load_device))
         self._validate_checkpoint_devices(weight_dict, load_device)
+        self.h3_checkpoint_file_stats.append(
+            {
+                "file": os.path.basename(file_path),
+                "file_size_bytes": os.path.getsize(file_path),
+                "tensor_count": tensor_count,
+                "source_tensor_bytes": source_tensor_bytes,
+                "retained_tensor_bytes": retained_tensor_bytes,
+                "started_epoch": started_epoch,
+                "finished_epoch": time.time(),
+                "elapsed_seconds": time.perf_counter() - started,
+            }
+        )
         return weight_dict
 
     def _init_infer_class(self):
