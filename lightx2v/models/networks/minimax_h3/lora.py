@@ -1,6 +1,8 @@
 """LoRA merging for the native MiniMax-H3 inference implementation."""
 
 import gc
+import os
+import time
 
 import torch
 from loguru import logger
@@ -93,6 +95,11 @@ class MiniMaxH3LoraAdapter(LoraAdapter):
 
     @torch.no_grad()
     def _merge_file(self, path, strength=1.0, alpha=None):
+        telemetry_enabled = bool(self.model.config.get("h3_benchmark_load_telemetry", False))
+        started_epoch = time.time()
+        started = time.perf_counter()
+        source_tensor_bytes = 0
+        sharded_factor_bytes = 0
         with safe_open(path, framework="pt", device="cpu") as source:
             normalized_sources = {}
             unsupported = []
@@ -144,7 +151,13 @@ class MiniMaxH3LoraAdapter(LoraAdapter):
                 parameter = self.model.original_weight_dict[model_key]
                 lora_up = source.get_tensor(pair["up_key"])
                 lora_down = source.get_tensor(pair["down_key"])
+                if telemetry_enabled:
+                    source_tensor_bytes += lora_up.numel() * lora_up.element_size()
+                    source_tensor_bytes += lora_down.numel() * lora_down.element_size()
                 lora_up, lora_down = self._shard_factors(model_key, lora_up, lora_down)
+                if telemetry_enabled:
+                    sharded_factor_bytes += lora_up.numel() * lora_up.element_size()
+                    sharded_factor_bytes += lora_down.numel() * lora_down.element_size()
                 merge_device = self._merge_device(parameter)
                 lora_up = lora_up.to(device=merge_device, dtype=parameter.dtype)
                 lora_down = lora_down.to(device=merge_device, dtype=parameter.dtype)
@@ -174,6 +187,24 @@ class MiniMaxH3LoraAdapter(LoraAdapter):
             len(pairs),
             strength,
         )
+        if telemetry_enabled:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            if not hasattr(self.model, "h3_lora_file_stats"):
+                self.model.h3_lora_file_stats = []
+            self.model.h3_lora_file_stats.append(
+                {
+                    "file": os.path.basename(path),
+                    "file_size_bytes": os.path.getsize(path),
+                    "layers": len(pairs),
+                    "source_tensor_bytes": source_tensor_bytes,
+                    "sharded_factor_bytes": sharded_factor_bytes,
+                    "started_epoch": started_epoch,
+                    "finished_epoch": time.time(),
+                    "elapsed_seconds": time.perf_counter() - started,
+                    "strength": float(strength),
+                }
+            )
         return len(pairs)
 
     def apply_lora(self, lora_configs):

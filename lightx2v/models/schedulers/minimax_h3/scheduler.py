@@ -18,10 +18,21 @@ from lightx2v.models.schedulers.scheduler import BaseScheduler
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 
-def _make_schedule(num_grid_points: int, shift: float, device) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_schedule(num_grid_points: int, shift: float, device, base_sigmas=None) -> tuple[torch.Tensor, torch.Tensor]:
     if num_grid_points < 2:
         raise ValueError(f"MiniMax-H3 infer_steps must be at least 2, got {num_grid_points}")
-    base = torch.linspace(1.0, 0.0, num_grid_points, dtype=torch.float32, device="cpu")
+    if base_sigmas is None:
+        base = torch.linspace(1.0, 0.0, num_grid_points, dtype=torch.float32, device="cpu")
+    else:
+        base = torch.as_tensor(base_sigmas, dtype=torch.float32, device="cpu")
+        if base.ndim != 1 or base.numel() != num_grid_points:
+            raise ValueError(f"MiniMax-H3 h3_base_sigmas must contain {num_grid_points} scalar grid points")
+        if not bool(torch.isfinite(base).all()) or bool((base < 0).any()) or bool((base > 1).any()):
+            raise ValueError("MiniMax-H3 h3_base_sigmas must be finite and lie in [0, 1]")
+        if not bool((base[:-1] > base[1:]).all()):
+            raise ValueError("MiniMax-H3 h3_base_sigmas must be strictly descending")
+        if float(base[0]) != 1.0:
+            raise ValueError("MiniMax-H3 h3_base_sigmas must start at 1.0")
     sigmas = shift * base / (1.0 + (shift - 1.0) * base)
     sigmas = torch.unique_consecutive(sigmas).to(device)
     return sigmas, 1.0 - sigmas[:-1]
@@ -43,7 +54,8 @@ class MiniMaxH3Scheduler(BaseScheduler):
 
     def __init__(self, config):
         super().__init__(config)
-        self.num_grid_points = int(config["infer_steps"])
+        self.base_sigmas = config.get("h3_base_sigmas")
+        self.num_grid_points = len(self.base_sigmas) if self.base_sigmas is not None else int(config["infer_steps"])
         self.video_shift = float(config.get("video_flow_shift", 12.0))
         self.audio_shift = float(config.get("audio_flow_shift", 3.0))
         self.step_update = config.get("h3_step_update", "reference_blend")
@@ -51,8 +63,8 @@ class MiniMaxH3Scheduler(BaseScheduler):
             raise ValueError(f"MiniMax-H3 h3_step_update must be 'reference_blend' or 'training_euler', got {self.step_update!r}")
         if self.video_shift <= 0 or self.audio_shift <= 0:
             raise ValueError("MiniMax-H3 flow shifts must be positive")
-        self.video_sigmas, self.video_timesteps = _make_schedule(self.num_grid_points, self.video_shift, AI_DEVICE)
-        self.audio_sigmas, self.audio_timesteps = _make_schedule(self.num_grid_points, self.audio_shift, AI_DEVICE)
+        self.video_sigmas, self.video_timesteps = _make_schedule(self.num_grid_points, self.video_shift, AI_DEVICE, self.base_sigmas)
+        self.audio_sigmas, self.audio_timesteps = _make_schedule(self.num_grid_points, self.audio_shift, AI_DEVICE, self.base_sigmas)
         if self.video_timesteps.numel() != self.audio_timesteps.numel():
             raise ValueError("video and audio schedules collapsed to different step counts")
         # The user-facing value counts sigma grid points including terminal 0.

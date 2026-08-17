@@ -16,6 +16,14 @@
 
 --------------------------------------------------------------------------------
 
+> **Downstream MiniMax-H3 V100 work:** this branch contains a validated
+> four-GPU FP16 TP4 path for Tesla V100, pruned AdaLN-curve checkpoint support,
+> precomputed T2V/I2V/R2V conditioning bundles, and separate official-VAE
+> decoding. See [the implementation and reproduction notes](docs/minimax_h3_v100_tp4.md)
+> and the [measured benchmark report](docs/minimax_h3_v100_tp4_benchmark.md).
+> This is an experimental downstream branch and is not an upstream-supported
+> LightX2V configuration.
+
 **LightX2V** is an advanced lightweight image/video generation inference framework engineered to deliver efficient, high-performance image/video synthesis solutions. This unified platform integrates multiple state-of-the-art image/video generation techniques, supporting diverse generation tasks including text-to-video (T2V), image-to-video (I2V), text-to-image (T2I), image-editing (I2I). **X2V represents the transformation of different input modalities (X, such as text or images) into vision output (Vision)**.
 
 > 🌐 **Try it online now!** Experience LightX2V without installation: **[LightX2V Studio](https://x2v.light-ai.top/)** — a free, lightweight AI video platform with **LTX 2.3**, **Wan 2.2**, **SekoTalk**, **Qwen-Image**, **SeedVR2**, and more models and tasks.

@@ -1,0 +1,49 @@
+{
+  "0": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "reference.png"
+    }
+  },
+  "3": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "YOUR_MINIMAX_H3_TEXT_ENCODER.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "5": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    }
+  },
+  "7": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "8": {
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "inputs": {
+      "clip": ["3", 0],
+      "vae": ["5", 0],
+      "audio_vae": ["7", 0],
+      "prompt": "YOUR_PROMPT",
+      "width": 864,
+      "height": 480,
+      "length": 124,
+      "ref_image_size": "match",
+      "ref_images.ref_image_0": ["0", 0]
+    }
+  },
+  "90": {
+    "class_type": "SaveMiniMaxH3Conditioning",
+    "inputs": {
+      "conditioning": ["8", 0],
+      "output_path": "/tmp/minimax-h3-ref2av-conditioning.safetensors"
+    }
+  }
+}

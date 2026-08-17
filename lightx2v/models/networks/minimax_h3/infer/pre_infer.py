@@ -22,9 +22,22 @@ def timestep_embedding(timesteps: torch.Tensor, embedding_dim: int = 256) -> tor
     return embedding
 
 
+def interpolate_adaln_curve(table: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+    """Linearly sample ComfyUI's H3 AdaLN curve for normalized timesteps."""
+    if table.ndim != 2 or table.shape[0] < 2:
+        raise ValueError(f"AdaLN curve table must be [grid>=2, basis], got {tuple(table.shape)}")
+    if timesteps.ndim != 1:
+        raise ValueError(f"timesteps must be one-dimensional, got {tuple(timesteps.shape)}")
+    pos = timesteps.float().clamp(0.0, 1.0) * (table.shape[0] - 1)
+    lower = pos.floor().long().clamp(max=table.shape[0] - 2)
+    return torch.lerp(table[lower], table[lower + 1], (pos - lower).unsqueeze(1))
+
+
 class MiniMaxH3PreInfer:
     def __init__(self, config):
         self.config = config
+        self.h3_v100_fp16 = bool(config.get("h3_v100_fp16", False))
+        self.h3_adaln_curve = bool(config.get("h3_adaln_curve", False))
         global_num_heads = int(config.get("num_attention_heads", 56))
         if config.get("tensor_parallel", False):
             tp_group = config["device_mesh"].get_group(mesh_dim="tensor_p")
@@ -42,6 +55,8 @@ class MiniMaxH3PreInfer:
         self.scheduler = scheduler
 
     def _attention(self, weights, hidden_states):
+        if self.h3_v100_fp16:
+            hidden_states = hidden_states.float()
         q = weights.to_q.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
         k = weights.to_k.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
         v = weights.to_v.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
@@ -59,10 +74,12 @@ class MiniMaxH3PreInfer:
             max_seqlen_kv=seq_len,
             causal=False,
         )
-        return weights.to_out.apply(out.to(GET_DTYPE()))
+        out_dtype = torch.float32 if self.h3_v100_fp16 else GET_DTYPE()
+        return weights.to_out.apply(out.to(out_dtype))
 
-    @staticmethod
-    def _ff(weights, hidden_states):
+    def _ff(self, weights, hidden_states):
+        if self.h3_v100_fp16:
+            hidden_states = hidden_states.float()
         value, gate = weights.in_proj.apply(hidden_states).chunk(2, dim=-1)
         return weights.out_proj.apply(value * F.silu(gate))
 
@@ -95,7 +112,7 @@ class MiniMaxH3PreInfer:
 
     def infer(self, weights, prompt_embeds):
         layout = self.scheduler.layout
-        bulk_dtype = GET_DTYPE()
+        bulk_dtype = torch.float32 if self.h3_v100_fp16 else GET_DTYPE()
 
         video_embeds = weights.proj_in.apply(self.scheduler.video_latents.float()).to(bulk_dtype)
         audio_embeds = weights.audio_proj_in.apply(self.scheduler.audio_latents.float()).to(bulk_dtype)
@@ -107,8 +124,11 @@ class MiniMaxH3PreInfer:
         hidden_states.index_copy_(0, layout.audio_indices, audio_embeds)
         hidden_states.index_copy_(0, layout.video_indices, video_embeds)
 
-        temb = timestep_embedding(self.scheduler.unique_timesteps, self.freq_dim)
-        temb = weights.time_linear_2.apply(F.silu(weights.time_linear_1.apply(temb.float())))
+        if self.h3_adaln_curve:
+            temb = interpolate_adaln_curve(weights.adaln_t_table.tensor, self.scheduler.unique_timesteps)
+        else:
+            temb = timestep_embedding(self.scheduler.unique_timesteps, self.freq_dim)
+            temb = weights.time_linear_2.apply(F.silu(weights.time_linear_1.apply(temb.float())))
         timestep_indices = self.scheduler.timestep_indices
         adaln_indices = timestep_indices * 3 + layout.token_tags.clamp(min=0)
 
