@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from contextlib import suppress
@@ -7,6 +8,7 @@ import torch
 import torch.distributed as dist
 from PIL import Image, ImageOps
 from loguru import logger
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from lightx2v.models.networks.minimax_h3.lora import MiniMaxH3LoraAdapter
@@ -331,6 +333,141 @@ class MiniMaxH3Runner(DefaultRunner):
             }
         return self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references)
 
+    def _load_precomputed_conditioning_bundle(self):
+        precomputed_path = self.config.get("precomputed_condition_path")
+        if not precomputed_path:
+            raise ValueError("MiniMax-H3 precomputed conditioning path is not configured")
+        with safe_open(precomputed_path, framework="pt", device="cpu") as source:
+            metadata = dict(source.metadata() or {})
+            tensors = {key: source.get_tensor(key) for key in source.keys()}
+        required = {"prompt_embeds", "text_token_tags"}
+        missing = required.difference(tensors)
+        if missing:
+            raise ValueError(f"MiniMax-H3 precomputed conditioning is missing tensors: {sorted(missing)}")
+        prompt_embeds = tensors["prompt_embeds"]
+        text_token_tags = tensors["text_token_tags"]
+        if prompt_embeds.ndim != 2 or prompt_embeds.shape[-1] != 5120:
+            raise ValueError(f"MiniMax-H3 prompt_embeds must be [tokens, 5120], got {tuple(prompt_embeds.shape)}")
+        if text_token_tags.ndim != 1 or text_token_tags.shape[0] != prompt_embeds.shape[0]:
+            raise ValueError(
+                "MiniMax-H3 text_token_tags must be one-dimensional and match prompt_embeds rows; "
+                f"got embeds={tuple(prompt_embeds.shape)}, tags={tuple(text_token_tags.shape)}"
+            )
+        raw_bundle = metadata.get("minimax_h3_bundle")
+        bundle = json.loads(raw_bundle) if raw_bundle else {
+            "format": "minimax_h3_conditioning_bundle",
+            "version": 0,
+            "task": "t2av",
+            "keyframes": [],
+            "references": [],
+        }
+        if bundle.get("format") != "minimax_h3_conditioning_bundle":
+            raise ValueError(f"Unsupported MiniMax-H3 conditioning bundle format: {bundle.get('format')!r}")
+        if int(bundle.get("version", 0)) not in {0, 1}:
+            raise ValueError(f"Unsupported MiniMax-H3 conditioning bundle version: {bundle.get('version')!r}")
+        logger.info(
+            "Loaded precomputed MiniMax-H3 {} conditioning from {}: {}, keyframes={}, references={}",
+            bundle.get("task", "t2av"),
+            precomputed_path,
+            tuple(prompt_embeds.shape),
+            len(bundle.get("keyframes") or []),
+            len(bundle.get("references") or []),
+        )
+        return (
+            {
+                "prompt_embeds": prompt_embeds.to(AI_DEVICE),
+                "text_token_tags": text_token_tags.to(AI_DEVICE),
+            },
+            bundle,
+            tensors,
+        )
+
+    @staticmethod
+    def _bundle_tensor(tensors, name, description):
+        if not name or name not in tensors:
+            raise ValueError(f"MiniMax-H3 conditioning bundle is missing {description} tensor {name!r}")
+        return tensors[name]
+
+    def _restore_precomputed_media_conditioning(self, bundle, tensors):
+        task = self.config["task"]
+        bundle_task = bundle.get("task", "t2av")
+        if bundle_task != task:
+            raise ValueError(f"MiniMax-H3 conditioning task mismatch: runner={task!r}, bundle={bundle_task!r}")
+        frame_count = bundle.get("frame_count")
+        if frame_count is not None and int(frame_count) != self.request_num_frames:
+            raise ValueError(
+                f"MiniMax-H3 conditioning frame mismatch: request={self.request_num_frames}, bundle={frame_count}"
+            )
+
+        if task in {"i2av", "l2av", "fl2av"}:
+            entries = bundle.get("keyframes") or []
+            expected = {"i2av": ("first",), "l2av": ("last",), "fl2av": ("first", "last")}[task]
+            anchors = tuple(str(entry.get("anchor")) for entry in entries)
+            if anchors != expected:
+                raise ValueError(f"MiniMax-H3 {task} bundle needs anchors {expected}, got {anchors}")
+            for index, entry in enumerate(entries):
+                latent = self._bundle_tensor(tensors, entry.get("tensor"), f"keyframe {index}")
+                if latent.ndim != 5 or latent.shape[0] != 1 or latent.shape[1] != int(self.config.get("in_channels", 24)):
+                    raise ValueError(f"MiniMax-H3 keyframe {index} latent must be [1,24,T,H,W], got {tuple(latent.shape)}")
+                if tuple(latent.shape[-2:]) != (
+                    self.request_height // int(self.config.get("vae_spatial_scale_factor", 16)),
+                    self.request_width // int(self.config.get("vae_spatial_scale_factor", 16)),
+                ):
+                    raise ValueError(
+                        f"MiniMax-H3 keyframe {index} latent geometry {tuple(latent.shape[-2:])} does not match "
+                        f"request {self.request_height}x{self.request_width}"
+                    )
+                self.condition_video_latents.append(latent)
+            self.keyframe_anchors = anchors
+            return
+
+        if task == "ref2av":
+            entries = bundle.get("references") or []
+            if not entries:
+                raise ValueError("MiniMax-H3 ref2av conditioning bundle has no references")
+            references = []
+            for index, entry in enumerate(entries):
+                kind = str(entry.get("kind", ""))
+                if kind not in {"image", "video", "audio"}:
+                    raise ValueError(f"Unsupported MiniMax-H3 reference kind at index {index}: {kind!r}")
+                has_audio = bool(entry.get("has_audio", False))
+                reference = MiniMaxH3PreparedReference(kind=kind, has_audio=has_audio)
+                if kind != "audio":
+                    latent = self._bundle_tensor(tensors, entry.get("video_tensor"), f"reference {index} video")
+                    if latent.ndim != 5 or latent.shape[0] != 1 or latent.shape[1] != int(self.config.get("in_channels", 24)):
+                        raise ValueError(f"MiniMax-H3 reference {index} video latent must be [1,24,T,H,W], got {tuple(latent.shape)}")
+                    reference.num_latent_frames = int(entry.get("num_latent_frames", latent.shape[2]))
+                    reference.latent_height = int(entry.get("latent_height", latent.shape[3]))
+                    reference.latent_width = int(entry.get("latent_width", latent.shape[4]))
+                    if (reference.num_latent_frames, reference.latent_height, reference.latent_width) != tuple(latent.shape[2:]):
+                        raise ValueError(
+                            f"MiniMax-H3 reference {index} metadata/latent shape mismatch: "
+                            f"metadata={(reference.num_latent_frames, reference.latent_height, reference.latent_width)}, "
+                            f"latent={tuple(latent.shape[2:])}"
+                        )
+                    self.condition_video_latents.append(latent)
+                if has_audio:
+                    audio = self._bundle_tensor(tensors, entry.get("audio_tensor"), f"reference {index} audio")
+                    if audio.ndim == 4 and audio.shape[0] == 1:
+                        audio = audio.squeeze(0).permute(1, 0, 2).contiguous()
+                    if audio.ndim != 3 or audio.shape[0] != 2 or audio.shape[1] != int(self.config.get("audio_in_channels", 32)):
+                        raise ValueError(f"MiniMax-H3 reference {index} audio latent must be [2,32,T], got {tuple(audio.shape)}")
+                    reference.num_audio_latents = int(entry.get("num_audio_latents", audio.shape[-1]))
+                    if reference.num_audio_latents != audio.shape[-1]:
+                        raise ValueError(
+                            f"MiniMax-H3 reference {index} audio metadata/latent length mismatch: "
+                            f"metadata={reference.num_audio_latents}, latent={audio.shape[-1]}"
+                        )
+                    self.condition_audio_latents.append(audio)
+                references.append(reference)
+            self.prepared_references = references
+            return
+
+        if task != "t2av":
+            raise ValueError(f"MiniMax-H3 precomputed media restoration does not support task {task!r}")
+        if bundle.get("keyframes") or bundle.get("references"):
+            raise ValueError("MiniMax-H3 t2av conditioning bundle must not contain media conditions")
+
     @staticmethod
     def _load_rgb_image(value):
         if isinstance(value, Image.Image):
@@ -505,7 +642,11 @@ class MiniMaxH3Runner(DefaultRunner):
         self.condition_audio_latents = []
         self.keyframe_anchors = ()
         self.prepared_references = None
-        if task == "ref2av":
+        if self.config.get("precomputed_condition_path"):
+            self._resolve_request_geometry()
+            text_encoder_output, bundle, tensors = self._load_precomputed_conditioning_bundle()
+            self._restore_precomputed_media_conditioning(bundle, tensors)
+        elif task == "ref2av":
             self._resolve_request_geometry()
             self.prepared_references = self._prepare_references()
             text_encoder_output = self.run_text_encoder(self.input_info, references=self.prepared_references)

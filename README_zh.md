@@ -16,6 +16,13 @@
 
 --------------------------------------------------------------------------------
 
+> **MiniMax-H3 V100 下游适配：**此分支包含已经实测的四卡 Tesla V100
+> FP16 TP4 路线、pruned AdaLN curve checkpoint、预计算 T2V/I2V/R2V
+> conditioning bundle，以及独立官方 VAE 解码。实现和复现方法见
+> [中文说明](docs/minimax_h3_v100_tp4_zh.md)，实测数据见
+> [benchmark 报告](docs/minimax_h3_v100_tp4_benchmark.md)。
+> 这是下游实验分支，不代表 LightX2V 上游正式支持。
+
 **LightX2V** 是一个先进的轻量级图像视频生成推理框架，专为提供高效、高性能的图像视频生成解决方案而设计。该统一平台集成了多种前沿的图像视频生成技术，支持文本生成视频(T2V)和图像生成视频(I2V)，文本生图片(T2I)，图像编辑(I2I)等多样化生成任务。**X2V 表示将不同的输入模态(X，如文本或图像)转换为视觉输出(Vision)**。
 
 > 🌐 **立即在线体验！** 无需安装即可体验 LightX2V：**[LightX2V Studio](https://x2v.light-ai.top/login)** - 免费、轻量、快速的AI视频生成平台，提供LTX2.3 / Wan 2.2 / SekoTalk / Qwen-Image / SeedVR2等多个模型多种任务的免费体验使用。

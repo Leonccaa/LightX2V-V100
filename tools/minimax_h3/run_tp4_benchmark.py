@@ -18,7 +18,7 @@ from safetensors import safe_open
 from lightx2v.common.ops import *  # noqa: F401,F403
 from lightx2v.models.networks.minimax_h3.packing import validate_t2av_geometry
 from lightx2v.models.runners.minimax_h3.minimax_h3_runner import MiniMaxH3Runner
-from lightx2v.utils.input_info import T2AVInputInfo
+from lightx2v.utils.input_info import I2AVInputInfo, Ref2AVInputInfo, T2AVInputInfo
 from lightx2v.utils.lockable_dict import LockableDict
 from lightx2v.utils.set_config import set_parallel_config
 from lightx2v_platform.registry_factory import PLATFORM_DEVICE_REGISTER
@@ -68,14 +68,17 @@ def _load_config(args: argparse.Namespace) -> tuple[LockableDict, dict]:
             "h3_latent_output_path": str(args.evidence_dir / f"{args.case_id}-trial1-latents.safetensors"),
         }
     )
-    with (args.model_path / "transformer" / "config.json").open("r", encoding="utf-8") as handle:
+    if args.condition_path is not None:
+        runtime_config["precomputed_condition_path"] = str(args.condition_path)
+    transformer_path = args.transformer_path or args.model_path / "transformer"
+    with (transformer_path / "config.json").open("r", encoding="utf-8") as handle:
         transformer_config = json.load(handle)
 
     merged = {
         "model_cls": "minimax_h3",
-        "task": "t2av",
+        "task": args.task,
         "model_path": str(args.model_path),
-        "dit_original_ckpt": str(args.model_path / "transformer"),
+        "dit_original_ckpt": str(transformer_path),
         "use_prompt_enhancer": False,
         "warmup": False,
         "cfg_parallel": False,
@@ -88,6 +91,53 @@ def _load_config(args: argparse.Namespace) -> tuple[LockableDict, dict]:
     merged.update(transformer_config)
     merged.update(runtime_config)
     return LockableDict(merged), runtime_config
+
+
+def _load_jobs(path: Path | None) -> list[dict]:
+    if path is None:
+        return []
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("--jobs-manifest must contain a non-empty JSON list")
+    jobs: list[dict] = []
+    seen_ids: set[str] = set()
+    for index, raw_job in enumerate(payload, start=1):
+        if not isinstance(raw_job, dict):
+            raise TypeError(f"job {index} must be an object")
+        job = dict(raw_job)
+        job_id = str(job.get("id", f"job-{index:02d}"))
+        if not job_id or job_id in seen_ids:
+            raise ValueError(f"job {index} has an empty or duplicate id: {job_id!r}")
+        for required in ("condition_path", "output_path"):
+            if not job.get(required):
+                raise ValueError(f"job {job_id!r} is missing {required!r}")
+        seen_ids.add(job_id)
+        job["id"] = job_id
+        jobs.append(job)
+    return jobs
+
+
+def _wait_for_file(path: Path, timeout_seconds: float) -> dict[str, float]:
+    started_epoch = time.time()
+    started = time.perf_counter()
+    deadline = started + timeout_seconds
+    while not path.is_file():
+        if time.perf_counter() >= deadline:
+            raise TimeoutError(f"timed out waiting for pipeline input: {path}")
+        time.sleep(0.1)
+    return {
+        "started_epoch": started_epoch,
+        "finished_epoch": time.time(),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
+def _resolve_job_path(value: str | Path, manifest_path: Path | None) -> Path:
+    path = Path(value)
+    if path.is_absolute() or manifest_path is None:
+        return path
+    return manifest_path.parent / path
 
 
 def _timed_cuda_call(function, *args, **kwargs):
@@ -107,6 +157,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--model-path", required=True, type=Path)
+    parser.add_argument("--transformer-path", type=Path)
+    parser.add_argument("--task", choices=("t2av", "i2av", "ref2av"), default="t2av")
+    parser.add_argument("--reference-image", type=Path)
+    parser.add_argument("--condition-path", type=Path)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--case-id", required=True)
@@ -115,6 +169,8 @@ def main() -> None:
     parser.add_argument("--height", required=True, type=int)
     parser.add_argument("--width", required=True, type=int)
     parser.add_argument("--trials", type=int, default=2)
+    parser.add_argument("--jobs-manifest", type=Path)
+    parser.add_argument("--input-wait-seconds", type=float, default=900.0)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--effective-config", required=True, type=Path)
@@ -123,8 +179,13 @@ def main() -> None:
     args = parser.parse_args()
 
     validate_t2av_geometry(args.frames, args.height, args.width)
+    jobs = _load_jobs(args.jobs_manifest)
+    if jobs:
+        args.trials = len(jobs)
     if args.trials < 1:
         raise ValueError("--trials must be positive")
+    if args.input_wait_seconds <= 0:
+        raise ValueError("--input-wait-seconds must be positive")
 
     config, runtime_config = _load_config(args)
     platform_device = PLATFORM_DEVICE_REGISTER[os.getenv("PLATFORM", "cuda")]
@@ -198,6 +259,10 @@ def main() -> None:
             "text_rows": int(runner.inputs["text_encoder_output"]["prompt_embeds"].shape[0]),
             "audio_rows": int(runner.scheduler.audio_latents.shape[0]),
             "video_rows": int(runner.scheduler.video_latents.shape[0]),
+            "condition_audio_rows": int(runner.scheduler.num_condition_audio_rows),
+            "condition_video_rows": int(runner.scheduler.num_condition_video_rows),
+            "target_audio_rows": int(runner.scheduler.audio_latents.shape[0] - runner.scheduler.num_condition_audio_rows),
+            "target_video_rows": int(runner.scheduler.video_latents.shape[0] - runner.scheduler.num_condition_video_rows),
             "total_rows": int(runner.scheduler.layout.sequence_length),
             "latent_frames": int(runner.scheduler.num_latent_frames),
             "latent_height": int(runner.scheduler.latent_height),
@@ -222,17 +287,50 @@ def main() -> None:
 
     trials = []
     for trial_index in range(1, args.trials + 1):
-        output_path = args.evidence_dir / f"{args.case_id}-trial{trial_index}-latents.safetensors"
-        runner.set_config({"h3_latent_output_path": str(output_path)})
-        input_info = T2AVInputInfo(
-            seed=args.seed,
-            prompt=args.prompt,
-            target_shape=[args.height, args.width],
-            target_video_length=args.frames,
+        job = jobs[trial_index - 1] if jobs else {}
+        job_id = str(job.get("id", f"trial-{trial_index}"))
+        output_path = _resolve_job_path(
+            job.get("output_path", args.evidence_dir / f"{args.case_id}-trial{trial_index}-latents.safetensors"),
+            args.jobs_manifest,
         )
+        condition_path = _resolve_job_path(
+            job.get("condition_path", args.condition_path or config["precomputed_condition_path"]),
+            args.jobs_manifest,
+        )
+        condition_wait = _wait_for_file(condition_path, args.input_wait_seconds)
+        runner.set_config(
+            {
+                "h3_latent_output_path": str(output_path),
+                "precomputed_condition_path": str(condition_path),
+            }
+        )
+        seed = int(job.get("seed", args.seed))
+        prompt = str(job.get("prompt", args.prompt))
+        input_kwargs = {
+            "seed": seed,
+            "prompt": prompt,
+            "target_shape": [args.height, args.width],
+            "target_video_length": args.frames,
+        }
+        if args.task == "i2av":
+            input_info = I2AVInputInfo(
+                **input_kwargs,
+                image_path=str(args.reference_image or condition_path),
+            )
+        elif args.task == "ref2av":
+            input_info = Ref2AVInputInfo(
+                **input_kwargs,
+                image_path=str(args.reference_image or condition_path),
+            )
+        else:
+            input_info = T2AVInputInfo(**input_kwargs)
         trial = {
             "trial": trial_index,
-            "seed": args.seed,
+            "job_id": job_id,
+            "seed": seed,
+            "prompt": prompt,
+            "condition_path": str(condition_path),
+            "condition_wait": condition_wait,
             "output": str(output_path),
             "model_evaluations": [],
         }
@@ -286,6 +384,7 @@ def main() -> None:
                 "fps": 24,
             },
             "benchmark": {
+                "task": args.task,
                 "trials": args.trials,
                 "block_finite_check": bool(args.block_finite_check),
                 "feature_caching": config.get("feature_caching", "NoCaching"),
@@ -295,12 +394,20 @@ def main() -> None:
                 "dtype": os.getenv("DTYPE"),
                 "sensitive_layer_dtype": os.getenv("SENSITIVE_LAYER_DTYPE"),
                 "tensor_parallel": int(config["parallel"]["tensor_p_size"]),
-                "model_evaluations": len(config["h3_base_sigmas"]) - 1,
+                "model_evaluations": (
+                    len(config["h3_base_sigmas"]) - 1
+                    if "h3_base_sigmas" in config
+                    else int(config["infer_steps"]) - 1
+                ),
             },
             "fixture": {
                 "prompt": args.prompt,
                 "seed": args.seed,
+                "reference_image": str(args.reference_image) if args.reference_image else None,
+                "transformer_path": str(args.transformer_path or args.model_path / "transformer"),
                 "precomputed_condition_path": config.get("precomputed_condition_path"),
+                "jobs_manifest": str(args.jobs_manifest) if args.jobs_manifest else None,
+                "jobs": jobs,
             },
             "runtime": {
                 "torch": torch.__version__,

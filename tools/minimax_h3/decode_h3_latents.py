@@ -12,7 +12,6 @@ import argparse
 import gc
 import hashlib
 import json
-import os
 import time
 from pathlib import Path
 
@@ -91,16 +90,38 @@ def main() -> None:
     num_audio_latents = audio_latent_num_frames(num_frames)
     patch_size = tuple(int(value) for value in config.get("patch_size", (1, 2, 2)))
     in_channels = int(config.get("in_channels", 24))
+    target_video_rows = (
+        latent_frames
+        * (latent_height // patch_size[1])
+        * (latent_width // patch_size[2])
+    )
+    target_audio_rows = num_audio_latents * int(config.get("audio_channels", 2))
+    condition_video_rows = int(rows["video_rows"].shape[0]) - target_video_rows
+    condition_audio_rows = int(rows["audio_rows"].shape[0]) - target_audio_rows
+    if condition_video_rows < 0 or condition_audio_rows < 0:
+        raise ValueError(
+            "saved latent rows are shorter than the configured target geometry: "
+            f"video={rows['video_rows'].shape[0]}/{target_video_rows}, "
+            f"audio={rows['audio_rows'].shape[0]}/{target_audio_rows}"
+        )
+    source_layout = {
+        "video_rows": int(rows["video_rows"].shape[0]),
+        "audio_rows": int(rows["audio_rows"].shape[0]),
+        "condition_video_rows": condition_video_rows,
+        "condition_audio_rows": condition_audio_rows,
+        "target_video_rows": target_video_rows,
+        "target_audio_rows": target_audio_rows,
+    }
 
     video_latents = unpatchify_video_tokens(
-        rows["video_rows"],
+        rows["video_rows"][condition_video_rows:],
         latent_frames,
         latent_height,
         latent_width,
         channels=in_channels,
         patch_size=patch_size,
     )
-    audio_latents = unpack_audio_tokens(rows["audio_rows"], num_audio_latents)
+    audio_latents = unpack_audio_tokens(rows["audio_rows"][condition_audio_rows:], num_audio_latents)
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -161,6 +182,7 @@ def main() -> None:
         "source_latents": str(args.latents),
         "source_latents_sha256": _sha256(args.latents),
         "source_metadata": latent_metadata,
+        "source_layout": source_layout,
         "output": str(args.output),
         "output_sha256": _sha256(args.output),
         "device": torch.cuda.get_device_name(0),
