@@ -44,6 +44,7 @@ class MiniMaxH3Model(BaseTransformerModel):
     def __init__(self, model_path, config, device):
         self.h3_checkpoint_file_stats = []
         self.h3_v100_fp16 = bool(config.get("h3_v100_fp16", False))
+        self.h3_adaln_curve = bool(config.get("h3_adaln_curve", False))
         dtype = GET_DTYPE()
         if dtype != torch.bfloat16 and not (self.h3_v100_fp16 and dtype == torch.float16):
             raise ValueError(
@@ -64,6 +65,14 @@ class MiniMaxH3Model(BaseTransformerModel):
             raise NotImplementedError("MiniMax-H3 currently supports load-time LoRA merging; set lora_dynamic_apply=false")
         if config.get("cpu_offload", False) and config.get("offload_granularity", "model") not in {"model", "block"}:
             raise NotImplementedError("MiniMax-H3 supports model and block CPU offload")
+        if self.h3_adaln_curve:
+            curve_grid = int(config.get("adaln_curve_grid", 0))
+            curve_basis = int(config.get("time_embed_dim", 0))
+            if curve_grid < 2 or curve_basis < 1:
+                raise ValueError(
+                    "MiniMax-H3 curve checkpoints require adaln_curve_grid>=2 and time_embed_dim>=1; "
+                    f"got grid={curve_grid}, basis={curve_basis}"
+                )
 
         transformer_path = config.get("dit_original_ckpt") or os.path.join(model_path, "transformer")
         super().__init__(transformer_path, config, device)
@@ -87,6 +96,8 @@ class MiniMaxH3Model(BaseTransformerModel):
             "proj_out",
             "audio_proj_out",
         }
+        if self.h3_adaln_curve:
+            self.sensitive_layer.add("adaln_t_table")
         self._init_infer_class()
         self._init_weights()
         self._init_infer()

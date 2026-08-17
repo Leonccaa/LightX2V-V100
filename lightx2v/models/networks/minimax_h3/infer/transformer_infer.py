@@ -24,6 +24,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         self.head_dim = int(config.get("attention_head_dim", 128))
         self.infer_dtype = GET_DTYPE()
         self.h3_v100_fp16 = bool(config.get("h3_v100_fp16", False))
+        self.h3_adaln_curve = bool(config.get("h3_adaln_curve", False))
         self.h3_finite_check = bool(config.get("h3_finite_check", False))
         if config.get("seq_parallel", False):
             self.seq_p_group = config["device_mesh"].get_group(mesh_dim="seq_p")
@@ -114,7 +115,8 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
     def infer_block(self, weights, hidden_states, pre_infer_out):
         # Activation is evaluated in fp32, then cast to the inference dtype
         # immediately before the (possibly quantized) AdaLN projection.
-        modulation = weights.adaln.apply(F.silu(pre_infer_out.temb).to(self.infer_dtype))
+        adaln_input = pre_infer_out.temb if self.h3_adaln_curve else F.silu(pre_infer_out.temb).to(self.infer_dtype)
+        modulation = weights.adaln.apply(adaln_input)
         modulation = self._gather_tp_last_dim(modulation)
         if self.h3_v100_fp16:
             modulation = modulation.float()

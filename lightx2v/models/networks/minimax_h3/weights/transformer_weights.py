@@ -7,20 +7,21 @@ from lightx2v.models.networks.minimax_h3.weights.tensor_parallel import MiniMaxH
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER, RMS_WEIGHT_REGISTER, ROPE_REGISTER
 
 
-def _linear(config, name, bias=False, create_cuda_buffer=False, tp_split=None):
+def _linear(config, name, bias=False, create_cuda_buffer=False, tp_split=None, force_fp32=False):
+    mm_type = "Default-ForceFp32" if force_fp32 else config.get("dit_quant_scheme", "Default")
     if config.get("tensor_parallel", False) and tp_split is not None:
         tp_group = config["device_mesh"].get_group(mesh_dim="tensor_p")
         return MiniMaxH3TensorParallelLinear(
             weight_name=f"{name}.weight",
             bias_name=f"{name}.bias" if bias else None,
-            mm_type=config.get("dit_quant_scheme", "Default"),
+            mm_type=mm_type,
             tp_group=tp_group,
             tp_rank=dist.get_rank(tp_group),
             tp_size=dist.get_world_size(tp_group),
             split_dim=tp_split,
             create_cuda_buffer=create_cuda_buffer,
         )
-    return MM_WEIGHT_REGISTER[config.get("dit_quant_scheme", "Default")](
+    return MM_WEIGHT_REGISTER[mm_type](
         f"{name}.weight",
         f"{name}.bias" if bias else None,
         create_cuda_buffer=create_cuda_buffer,
@@ -117,7 +118,17 @@ class MiniMaxH3TransformerBlockWeights(WeightModule):
         self.add_module("ff", MiniMaxH3FeedForwardWeights(f"{prefix}.ff", config, create_cuda_buffer))
         # AdaLN is the largest per-block projection in H3.  Its output is
         # column-sharded here and gathered once per block before modulation.
-        self.add_module("adaln", _linear(config, f"{prefix}.adaln_proj.linear", bias=True, create_cuda_buffer=create_cuda_buffer, tp_split="col"))
+        self.add_module(
+            "adaln",
+            _linear(
+                config,
+                f"{prefix}.adaln_proj.linear",
+                bias=True,
+                create_cuda_buffer=create_cuda_buffer,
+                tp_split="col",
+                force_fp32=bool(config.get("h3_adaln_curve", False)),
+            ),
+        )
 
 
 class MiniMaxH3TransformerWeights(WeightModule):

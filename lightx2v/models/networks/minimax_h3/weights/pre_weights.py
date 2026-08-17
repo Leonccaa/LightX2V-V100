@@ -2,7 +2,7 @@ import torch.distributed as dist
 
 from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList
 from lightx2v.models.networks.minimax_h3.weights.tensor_parallel import MiniMaxH3TensorParallelLinear
-from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER, RMS_WEIGHT_REGISTER
+from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER, RMS_WEIGHT_REGISTER, TENSOR_REGISTER
 
 
 def _linear(name, bias=False, force_fp32=False, config=None, tp_split=None):
@@ -71,13 +71,16 @@ class MiniMaxH3TokenRefinerBlockWeights(WeightModule):
 class MiniMaxH3PreWeights(WeightModule):
     def __init__(self, config):
         super().__init__()
-        # The released checkpoint deliberately keeps the two media projections
-        # and timestep MLP in fp32.  The text projection/refiner stay bf16.
+        # The full checkpoint keeps the timestep MLP in fp32. Curve-form
+        # checkpoints replace that MLP with an fp32 interpolation table.
         self.add_module("proj_in", _linear("proj_in", bias=True, force_fp32=True))
         self.add_module("audio_proj_in", _linear("audio_proj_in", bias=True, force_fp32=True))
         self.add_module("context_embedder", _linear("context_embedder", bias=True, force_fp32=bool(config.get("h3_v100_fp16", False))))
-        self.add_module("time_linear_1", _linear("time_embedder.linear_1", bias=True, force_fp32=True))
-        self.add_module("time_linear_2", _linear("time_embedder.linear_2", bias=True, force_fp32=True))
+        if config.get("h3_adaln_curve", False):
+            self.register_parameter("adaln_t_table", TENSOR_REGISTER["Default"]("adaln_t_table"))
+        else:
+            self.add_module("time_linear_1", _linear("time_embedder.linear_1", bias=True, force_fp32=True))
+            self.add_module("time_linear_2", _linear("time_embedder.linear_2", bias=True, force_fp32=True))
         self.add_module(
             "refiner_blocks",
             WeightModuleList([MiniMaxH3TokenRefinerBlockWeights(i, config) for i in range(int(config.get("num_refiner_layers", 2)))]),
